@@ -1,0 +1,124 @@
+#version 430 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba8) writeonly uniform image2D outImage;
+layout(std140, binding = 1) uniform Camera {
+    vec3 camPos;     float _pad0;
+    vec3 camRight;   float _pad1;
+    vec3 camUp;      float _pad2;
+    vec3 camForward; float _pad3;
+    float tanHalfFov;
+    float aspect;
+    bool moving;
+    int   _pad4;
+} cam;
+
+layout(std140, binding = 2) uniform Disk {
+    float disk_r1;
+    float disk_r2;
+    float disk_num;
+    float thickness;
+};
+
+layout(std140, binding = 3) uniform Objects {
+    int numObjects;
+    vec4 objPosRadius[16];
+    vec4 objColor[16];
+    float  mass[16]; 
+};
+
+// Globals
+vec4 objectColor = vec4(0.0);
+vec3 hitCenter = vec3(0.0);
+float hitRadius = 0.0;
+
+const float SagA_rs = 1.269e10;
+const float ESCAPE_R  = 150.0;     
+const int MAX_STEPS = 3000;
+
+vec4 deriv(vec4 s) {
+    return vec4(s.z, s.w, (s.x - 1.5) * s.w * s.w, -2.0 * s.z * s.w / s.x);
+}
+
+void rk4(inout vec4 s, float h) {
+    vec4 k1 = deriv(s);
+    vec4 k2 = deriv(s + 0.5 * h * k1);
+    vec4 k3 = deriv(s + 0.5 * h * k2);
+    vec4 k4 = deriv(s + h * k3);
+    s += (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+}
+
+
+bool interceptObject(vec3 a, vec3 b, out vec3 hit) {
+    hit = vec3(0.0);
+    vec3 d = b - a;
+    float A = dot(d, d);
+    float tBest = 2.0;
+    for (int i = 0; i < numObjects; ++i) {
+        vec3  c = objPosRadius[i].xyz / SagA_rs;
+        float R = objPosRadius[i].w   / SagA_rs;
+        vec3 m = a - c;
+        float B = dot(m, d);
+        float C = dot(m, m) - R * R;
+        float disc = B * B - A * C;
+        if (disc < 0.0) continue;
+        float t = (-B - sqrt(disc)) / A;
+        if (t < 0.0 || t > 1.0 || t >= tBest) continue;
+        tBest = t;
+        objectColor = objColor[i];
+        hitCenter   = c;
+        hitRadius   = R;
+    }
+    if (tBest > 1.0) return false;
+    hit = a + tBest * d;
+    return true;
+}
+
+void main() {
+    ivec2 size = imageSize(outImage);
+    ivec2 pix  = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    float u = (2.0 * (pix.x + 0.5) / size.x - 1.0) * cam.aspect * cam.tanHalfFov;
+    float v = (1.0 - 2.0 * (pix.y + 0.5) / size.y) * cam.tanHalfFov;
+    vec3 dir = normalize(u * cam.camRight - v * cam.camUp + cam.camForward);
+
+    vec3 p  = cam.camPos / SagA_rs;
+    float r0 = length(p);
+    vec3 e1 = p / r0;
+    vec3 e2 = dir - dot(dir, e1) * e1;
+    float sinPsi = length(e2);
+    e2 = (sinPsi > 1e-6) ? e2 / sinPsi : vec3(0.0);
+
+    // r, phi, dr, dphi
+    vec4 s = vec4(r0, 0.0, sqrt(1.0 - 1.0 / r0) * dot(dir, e1), sinPsi / r0);
+
+    vec3 prevPos = p;
+    vec3 color   = vec3(0.0);          // empty sky
+
+    for (int i = 0; i < MAX_STEPS; ++i) {
+        if (s.x < 1.0) break;                              // captured
+        if (s.x > ESCAPE_R && s.z > 0.0) break;            // escaped
+
+        rk4(s, 0.02 * s.x);
+        vec3 newPos = s.x * (cos(s.y) * e1 + sin(s.y) * e2);
+
+        if (prevPos.y * newPos.y < 0.0) {                  // disk plane
+            vec3  hp = mix(prevPos, newPos, prevPos.y / (prevPos.y - newPos.y));
+            float rd = length(hp.xz);
+            if (rd >= disk_r1 / SagA_rs && rd <= disk_r2 / SagA_rs) {
+                color = vec3(1.0, 0.6, 0.2);
+                break;
+            }
+        }
+
+        vec3 ho;
+        if (interceptObject(prevPos, newPos, ho)) {
+            color = objectColor.rgb;
+            break;
+        }
+        prevPos = newPos;
+    }
+
+    imageStore(outImage, pix, vec4(color, 1.0));
+}
